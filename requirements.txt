@@ -1,0 +1,24 @@
+# Dependencias del proyecto Medical ML Pipeline
+# Valentin Moreno Vasquez - Ingeniero Biomedico, Especialista en IA
+#
+# Instalar con:
+#   pip install -r requirements.txt
+
+# --- Datos y modelo ---
+pandas==2.2.2          # manipulacion de datos
+numpy==1.26.4          # operaciones numericas
+scikit-learn==1.4.2    # modelo RandomForest y metricas
+joblib==1.4.2          # guardar y cargar el modelo en disco
+
+# --- Optimizacion de hiperparametros ---
+optuna==3.6.1          # busqueda automatica de mejores hiperparametros
+
+# --- MLOps: seguimiento de experimentos ---
+mlflow==2.13.0         # registra cada entrenamiento con sus metricas y parametros
+
+# --- API ---
+fastapi==0.111.0       # framework para la API REST
+uvicorn==0.29.0        # servidor para correr FastAPI
+
+# --- Tests ---
+pytest==8.2.0          # correr tests con: pytest tests/

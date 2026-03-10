@@ -1,0 +1,10 @@
+artifact_location: file:///C:/Users/Janus/Desktop/medical-ml-pipeline-mlops/mlruns/786445582204128962/models/m-8f21db3afaf44b7e85be146c0053d2da/artifacts
+creation_timestamp: 1773178497554
+experiment_id: '786445582204128962'
+last_updated_timestamp: 1773178501409
+model_id: m-8f21db3afaf44b7e85be146c0053d2da
+model_type: null
+name: modelo
+source_run_id: 6e9cdb2a3ef4485b860971de96f49668
+status: 2
+status_message: null
