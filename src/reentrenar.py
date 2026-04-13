@@ -1,198 +1,240 @@
-# Automatizacion: Reentrenamiento automatico
+# Automatizacion: Reentrenamiento automatico con XGBoost
 # Lo que hace este script:
 #   - Revisa si llegaron datos nuevos a la carpeta data/nuevos/
 #   - Si hay datos nuevos, los une con los existentes y reentrena el modelo
 #   - Registra el nuevo entrenamiento en MLflow
-#   - Solo reentrena si los datos nuevos mejoran el modelo
+#   - Solo reemplaza el modelo si el nuevo es mejor
 #
-# Para automatizarlo puedes usar cron (Linux/Mac) o Task Scheduler (Windows):
-#   cron ejemplo: 0 2 * * * python src/reentrenar.py  (corre a las 2am cada dia)
+# Para automatizarlo:
+#   cron (Linux/Mac): 0 2 * * * python src/reentrenar.py
+#   Task Scheduler (Windows): ejecutar diariamente a las 2am
 #
 # Valentin Moreno Vasquez - Ingeniero Biomedico, Especialista en IA
-
+ 
 import os
 import pandas as pd
+import numpy as np
 import joblib
 import mlflow
 import mlflow.sklearn
-
-from sklearn.ensemble import RandomForestClassifier
+import matplotlib.pyplot as plt
+ 
+from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
-
-# Rutas del proyecto
-RUTA_DATOS_ACTUALES = "data/diabetes_limpio.csv"
-RUTA_DATOS_NUEVOS   = "data/nuevos/"           # carpeta donde llegan datos nuevos
+from sklearn.metrics import (
+    roc_auc_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
+ 
+RUTA_DATOS_ACTUALES   = "data/diabetes_limpio.csv"
+RUTA_DATOS_NUEVOS     = "data/nuevos/"
 RUTA_DATOS_UNIFICADOS = "data/datos_unificados.csv"
-RUTA_MODELO         = "models/mejor_modelo.pkl"
-RUTA_METRICAS       = "models/metricas.txt"    # guardamos el AUC del modelo actual
-
-
+RUTA_MODELO           = "models/mejor_modelo.pkl"
+RUTA_COLUMNAS         = "models/columnas.pkl"
+RUTA_UMBRAL           = "models/umbral.pkl"
+RUTA_METRICAS         = "models/metricas.txt"
+ 
+# Ratio desbalance — igual que en entrenar.py
+SCALE_POS_WEIGHT = 8
+ 
+ 
 def hay_datos_nuevos():
-    """
-    Revisa si existe la carpeta de datos nuevos y tiene archivos CSV.
-    Retorna True si hay datos para procesar, False si no.
-    """
+    """Revisa si hay CSVs en la carpeta de datos nuevos."""
     if not os.path.exists(RUTA_DATOS_NUEVOS):
         return False
-
-    # Buscamos archivos CSV en la carpeta
-    archivos_csv = [
-        f for f in os.listdir(RUTA_DATOS_NUEVOS)
-        if f.endswith(".csv")
-    ]
-
-    return len(archivos_csv) > 0
-
-
+    return len([f for f in os.listdir(RUTA_DATOS_NUEVOS) if f.endswith(".csv")]) > 0
+ 
+ 
 def cargar_datos_nuevos():
-    """
-    Une todos los CSV de la carpeta de datos nuevos en un solo DataFrame.
-    Retorna el DataFrame combinado.
-    """
-    archivos = [
-        f for f in os.listdir(RUTA_DATOS_NUEVOS)
-        if f.endswith(".csv")
-    ]
-
+    """Une todos los CSVs de datos nuevos en un solo DataFrame."""
+    archivos = [f for f in os.listdir(RUTA_DATOS_NUEVOS) if f.endswith(".csv")]
     dfs = []
     for archivo in archivos:
         ruta = os.path.join(RUTA_DATOS_NUEVOS, archivo)
-        df = pd.read_csv(ruta)
+        df   = pd.read_csv(ruta)
         dfs.append(df)
-        print(f"  -> Cargado: {archivo} ({len(df)} filas)")
-
+        print(f"  -> Cargado: {archivo} ({len(df):,} filas)")
     return pd.concat(dfs, ignore_index=True)
-
-
-def leer_auc_actual():
-    """
-    Lee el AUC del modelo actualmente en produccion.
-    Si no existe el archivo de metricas, asume AUC = 0.
-    """
+ 
+ 
+def leer_metricas_actuales():
+    """Lee las metricas del modelo en produccion."""
+    metricas = {"auc_test": 0.0, "recall_clase1": 0.0, "f1_clase1": 0.0, "umbral": 0.5}
     if not os.path.exists(RUTA_METRICAS):
-        return 0.0
-
-    with open(RUTA_METRICAS, "r") as f:
-        linea = f.read().strip()
-
-    # El archivo guarda algo como: "auc_test=0.6823"
+        return metricas
     try:
-        auc = float(linea.split("=")[1])
-        return auc
+        with open(RUTA_METRICAS, "r") as f:
+            for linea in f:
+                if "=" in linea:
+                    clave, valor = linea.strip().split("=")
+                    if clave in metricas:
+                        metricas[clave] = float(valor)
     except Exception:
-        return 0.0
-
-
-def guardar_auc(auc):
-    """Guarda el AUC del modelo en disco para comparar en el futuro."""
-    os.makedirs("models", exist_ok=True)
-    with open(RUTA_METRICAS, "w") as f:
-        f.write(f"auc_test={auc:.4f}")
-
-
+        pass
+    return metricas
+ 
+ 
+def optimizar_umbral(modelo, X_test, y_test):
+    """Busca el umbral que maximiza F1 de la clase positiva."""
+    y_proba      = modelo.predict_proba(X_test)[:, 1]
+    mejor_f1     = 0
+    mejor_umbral = 0.5
+    for umbral in np.arange(0.1, 0.9, 0.01):
+        y_pred = (y_proba >= umbral).astype(int)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        if f1 > mejor_f1:
+            mejor_f1     = f1
+            mejor_umbral = umbral
+    return mejor_umbral
+ 
+ 
 def entrenar_con_datos(df):
     """
-    Entrena un RandomForest con los parametros del modelo actual.
-    Retorna el modelo entrenado y su AUC en el conjunto de prueba.
+    Reentrena XGBoost con los parametros del modelo actual.
+    Si no existe modelo previo, usa parametros razonables por defecto.
     """
     X = df.drop(columns=["readmitido_30dias"])
     y = df["readmitido_30dias"]
-
+ 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-
-    # Usamos los parametros del modelo actual si existe
-    # Si no, usamos valores razonables por defecto
+ 
+    # Cargamos los parametros del modelo actual si existe
     if os.path.exists(RUTA_MODELO):
         modelo_actual = joblib.load(RUTA_MODELO)
+        # XGBoost guarda los parametros en get_params()
+        params_actuales = modelo_actual.get_params()
         params = {
-            "n_estimators":     modelo_actual.n_estimators,
-            "max_depth":        modelo_actual.max_depth,
-            "min_samples_split": modelo_actual.min_samples_split,
-            "min_samples_leaf": modelo_actual.min_samples_leaf,
+            "n_estimators":     params_actuales.get("n_estimators", 200),
+            "max_depth":        params_actuales.get("max_depth", 5),
+            "learning_rate":    params_actuales.get("learning_rate", 0.1),
+            "subsample":        params_actuales.get("subsample", 0.8),
+            "colsample_bytree": params_actuales.get("colsample_bytree", 0.8),
+            "min_child_weight": params_actuales.get("min_child_weight", 3),
+            "gamma":            params_actuales.get("gamma", 0),
+            "reg_alpha":        params_actuales.get("reg_alpha", 0),
+            "reg_lambda":       params_actuales.get("reg_lambda", 1),
         }
     else:
         params = {
-            "n_estimators": 100,
-            "max_depth": 8,
-            "min_samples_split": 5,
-            "min_samples_leaf": 2,
+            "n_estimators": 200, "max_depth": 5,
+            "learning_rate": 0.1, "subsample": 0.8,
+            "colsample_bytree": 0.8, "min_child_weight": 3,
         }
-
-    modelo_nuevo = RandomForestClassifier(**params, random_state=42, n_jobs=-1)
+ 
+    modelo_nuevo = XGBClassifier(
+        **params,
+        scale_pos_weight = SCALE_POS_WEIGHT,
+        random_state     = 42,
+        n_jobs           = -1,
+        verbosity        = 0,
+        eval_metric      = "auc",
+    )
     modelo_nuevo.fit(X_train, y_train)
-
-    y_proba = modelo_nuevo.predict_proba(X_test)[:, 1]
-    auc     = roc_auc_score(y_test, y_proba)
-
-    return modelo_nuevo, auc
-
-
+ 
+    # Optimizamos umbral
+    umbral   = optimizar_umbral(modelo_nuevo, X_test, y_test)
+    y_proba  = modelo_nuevo.predict_proba(X_test)[:, 1]
+    y_pred   = (y_proba >= umbral).astype(int)
+ 
+    metricas = {
+        "auc_test":      round(roc_auc_score(y_test, y_proba), 4),
+        "recall_clase1": round(recall_score(y_test, y_pred, zero_division=0), 4),
+        "f1_clase1":     round(f1_score(y_test, y_pred, zero_division=0), 4),
+        "umbral":        round(umbral, 2),
+    }
+ 
+    return modelo_nuevo, metricas, X_train, y_test, y_pred
+ 
+ 
 def reentrenar():
     """
     Funcion principal.
-    Revisa si hay datos nuevos, reentrena si los hay,
+    Revisa datos nuevos, reentrena si los hay,
     y solo reemplaza el modelo si el nuevo es mejor.
     """
-    print("=" * 50)
-    print("REVISION DE DATOS NUEVOS")
-    print("=" * 50)
-
-    # Paso 1: verificar si hay datos nuevos
+    print("=" * 55)
+    print("REENTRENAMIENTO AUTOMATICO")
+    print("=" * 55)
+ 
     if not hay_datos_nuevos():
-        print("No hay datos nuevos. No se reentrena.")
+        print("No hay datos nuevos en data/nuevos/. No se reentrena.")
         return
-
+ 
     print("Datos nuevos encontrados!")
-
-    # Paso 2: cargar y unir datos nuevos con los existentes
+ 
+    # Unir datos nuevos con existentes
     df_nuevos   = cargar_datos_nuevos()
     df_actuales = pd.read_csv(RUTA_DATOS_ACTUALES)
     df_total    = pd.concat([df_actuales, df_nuevos], ignore_index=True)
     df_total.to_csv(RUTA_DATOS_UNIFICADOS, index=False)
-    print(f"Total de datos para entrenamiento: {len(df_total)} filas")
-
-    # Paso 3: entrenar modelo nuevo con todos los datos
-    print("\nEntrenando modelo nuevo...")
-    modelo_nuevo, auc_nuevo = entrenar_con_datos(df_total)
-
-    # Paso 4: comparar con el modelo actual
-    auc_actual = leer_auc_actual()
-    print(f"\nAUC modelo actual: {auc_actual:.4f}")
-    print(f"AUC modelo nuevo:  {auc_nuevo:.4f}")
-
-    # Paso 5: solo reemplazamos si el nuevo es mejor (aunque sea un poco)
-    if auc_nuevo > auc_actual:
-        print("\nEl modelo nuevo es mejor! Reemplazando...")
-
-        # Guardamos el nuevo modelo
+    print(f"Total datos para entrenamiento: {len(df_total):,} filas")
+ 
+    # Entrenar modelo nuevo
+    print("\nEntrenando modelo nuevo con XGBoost...")
+    modelo_nuevo, metricas_nuevas, X_train, y_test, y_pred = entrenar_con_datos(df_total)
+ 
+    # Comparar con modelo actual
+    metricas_actuales = leer_metricas_actuales()
+    print(f"\nAUC modelo actual:  {metricas_actuales['auc_test']:.4f}")
+    print(f"AUC modelo nuevo:   {metricas_nuevas['auc_test']:.4f}")
+    print(f"Recall actual:      {metricas_actuales['recall_clase1']:.4f}")
+    print(f"Recall nuevo:       {metricas_nuevas['recall_clase1']:.4f}")
+ 
+    if metricas_nuevas["auc_test"] > metricas_actuales["auc_test"]:
+        print("\nEl modelo nuevo es mejor. Reemplazando...")
+ 
+        # Guardar nuevo modelo, columnas y umbral
+        os.makedirs("models", exist_ok=True)
         joblib.dump(modelo_nuevo, RUTA_MODELO)
-        guardar_auc(auc_nuevo)
-
-        # Registramos en MLflow
-        mlflow.set_experiment("readmision-hospitalaria")
+        joblib.dump(list(X_train.columns), RUTA_COLUMNAS)
+        joblib.dump(metricas_nuevas["umbral"], RUTA_UMBRAL)
+ 
+        with open(RUTA_METRICAS, "w") as f:
+            for k, v in metricas_nuevas.items():
+                f.write(f"{k}={v}\n")
+ 
+        # Registrar en MLflow
+        mlflow.set_experiment("readmision-hospitalaria-xgboost")
         with mlflow.start_run(run_name="reentrenamiento-automatico"):
-            mlflow.log_metric("auc_test",  auc_nuevo)
-            mlflow.log_metric("auc_previo", auc_actual)
-            mlflow.log_metric("datos_nuevos", len(df_nuevos))
+            mlflow.log_metric("auc_test",        metricas_nuevas["auc_test"])
+            mlflow.log_metric("auc_previo",       metricas_actuales["auc_test"])
+            mlflow.log_metric("recall_clase1",    metricas_nuevas["recall_clase1"])
+            mlflow.log_metric("f1_clase1",        metricas_nuevas["f1_clase1"])
+            mlflow.log_metric("datos_nuevos",     len(df_nuevos))
+            mlflow.log_param("umbral_decision",   metricas_nuevas["umbral"])
             mlflow.sklearn.log_model(modelo_nuevo, "modelo")
-
+ 
+            # Matriz de confusion
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ConfusionMatrixDisplay.from_predictions(
+                y_test, y_pred,
+                display_labels=["No readmitido", "Readmitido"],
+                cmap="Blues", ax=ax
+            )
+            ax.set_title("Matriz de Confusion - Reentrenamiento")
+            fig.savefig("models/confusion_matrix_reentrenamiento.png", bbox_inches="tight")
+            mlflow.log_artifact("models/confusion_matrix_reentrenamiento.png")
+            plt.close(fig)
+ 
         print("Modelo actualizado y registrado en MLflow!")
-
-        # Limpiamos la carpeta de datos nuevos (ya los procesamos)
+ 
+        # Limpiar carpeta de datos nuevos
         for archivo in os.listdir(RUTA_DATOS_NUEVOS):
             if archivo.endswith(".csv"):
                 os.remove(os.path.join(RUTA_DATOS_NUEVOS, archivo))
-        print("Carpeta de datos nuevos limpiada.")
-
+        print("Carpeta data/nuevos/ limpiada.")
+ 
     else:
         print("\nEl modelo actual es mejor. No se reemplaza.")
         print("Los datos nuevos se conservan para el proximo reentrenamiento.")
-
-    print("=" * 50)
-
-
+ 
+    print("=" * 55)
+ 
+ 
 if __name__ == "__main__":
     reentrenar()

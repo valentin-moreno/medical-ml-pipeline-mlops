@@ -9,7 +9,7 @@ pandas==2.2.2          # manipulacion de datos
 numpy==1.26.4          # operaciones numericas
 scikit-learn==1.4.2    # modelo RandomForest y metricas
 joblib==1.4.2          # guardar y cargar el modelo en disco
-
+xgboost==2.0.3
 # --- Optimizacion de hiperparametros ---
 optuna==3.6.1          # busqueda automatica de mejores hiperparametros
 

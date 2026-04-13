@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/diabetes_raw.csv
+data/diabetes_limpio.csv
+data/datos_unificados.csv
+data/nuevos/
+models/
+mlruns/
+.pytest_cache/
+*.egg-info/

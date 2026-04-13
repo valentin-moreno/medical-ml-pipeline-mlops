@@ -137,7 +137,6 @@ pytest tests/
 
 - [ ] Agregar monitoreo de data drift con Evidently
 - [ ] Containerizar con Docker
-- [ ] CI/CD con GitHub Actions
 - [ ] Deploy en Render o Railway
 
 ---
